@@ -919,8 +919,11 @@ class ErnieModel(ErniePreTrainedModel):
 
         # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
         # ourselves in which case we just need to make it broadcastable to all heads.
-        extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(attention_mask, input_shape)
         # 扩展维度到四维, (bs, n, s, s)
+        if len(attention_mask.shape) > 4:
+            extended_attention_mask: torch.Tensor = self.get_extended_attention_mask(attention_mask, input_shape)
+        else:
+            extended_attention_mask = attention_mask
         
         # If a 2D or 3D attention mask is provided for the cross-attention
         # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
@@ -942,7 +945,7 @@ class ErnieModel(ErniePreTrainedModel):
 
         embedding_output = self.embeddings(   # (bs, s, h)
             input_ids=input_ids,   # (b, s)
-            position_ids=position_ids,
+            position_ids=position_ids,   # list[b, s]
             token_type_ids=token_type_ids,   # (b, s)
             task_type_ids=task_type_ids,
             inputs_embeds=inputs_embeds,
