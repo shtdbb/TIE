@@ -1,2 +1,2 @@
 .vscode/*
-model/ernie3_base/*.bin
+*.bin
