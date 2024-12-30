@@ -1,3 +1,7 @@
 .vscode/*
 *.bin
 __pycache__
+data/*
+logs/*
+nohup.out
+.env
