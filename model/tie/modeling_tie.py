@@ -22,38 +22,54 @@ class TIE(torch.nn.Module):
         self.encoder = ErnieModel(self.encoder_config)
         self.begin_cls = torch.nn.Linear(self.encoder_config.hidden_size, 1)
         self.end_cls = torch.nn.Linear(self.encoder_config.hidden_size, 1)
-        
+        # 日期解码: 0~9, [U]
+        self.decoder = torch.nn.Linear(self.encoder_config.hidden_size, 11)
+        # self._initialize_weights()
 
-    def forawrd(self, inputs: dict) -> tuple[torch.Tensor, torch.Tensor]:
-        encoder_output = self.encoder(**inputs)
-        hidden_state = encoder_output[0]
-        
-        begin_logits = self.begin_cls(hidden_state)
-        end_logits = self.end_cls(hidden_state)
-        return (begin_logits, end_logits)
+
+    def forawrd(self,
+                inputs_list: list[dict[str, torch.Tensor]],
+                ) -> torch.Tensor:
+        last_all_embedding = None
+        begin_logits_list, end_logits_list, decoder_logits_list = [], [], []
+        for inputs in inputs_list:
+            encoder_output, cur_all_embedding = self.encoder(
+                                                    input_ids=inputs["input_ids"], 
+                                                    attention_mask=inputs["attention_mask"], 
+                                                    token_type_ids=inputs["token_type_ids"], 
+                                                    position_ids=inputs.get("position_ids", None), 
+                                                    last_all_embedding=last_all_embedding)
+            hidden_state = encoder_output[0]   # (bs, s, h)
+            last_all_embedding = cur_all_embedding
+            
+            begin_logits = self.begin_cls(hidden_state)   # (bs, s, 1)
+            end_logits = self.end_cls(hidden_state)   # (bs, s, 1)
+            decoder_logits = self.decoder(hidden_state)   # (bs, s, 11)
+            
+            begin_logits_list.append(begin_logits)
+            end_logits_list.append(end_logits)
+            decoder_logits_list.append(decoder_logits)
+
+        return begin_logits_list, end_logits_list, decoder_logits_list
+
 
     def _initialize_weights(self):
         """
         Initialize the weights of the begin_cls and end_cls layers using Kaiming initialization.
         """
-        torch.nn.init.kaiming_uniform_(self.begin_cls.weight, a=math.sqrt(5))
-        torch.nn.init.kaiming_uniform_(self.end_cls.weight, a=math.sqrt(5))
+        torch.nn.init.kaiming_uniform_(self.decoder.weight, a=math.sqrt(5))
         if self.begin_cls.bias is not None:
-            fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(self.begin_cls.weight)
+            fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(self.decoder.weight)
             bound = 1 / math.sqrt(fan_in)
-            torch.nn.init.uniform_(self.begin_cls.bias, -bound, bound)
-        if self.end_cls.bias is not None:
-            fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(self.end_cls.weight)
-            bound = 1 / math.sqrt(fan_in)
-            torch.nn.init.uniform_(self.end_cls.bias, -bound, bound)
-        
-    
+            torch.nn.init.uniform_(self.decoder.bias, -bound, bound)
+
+
     def save_pretrained(self, save_directory: str):
         """
         Save the model to the specified directory.
         """
         # Save the entire model state dictionary
-        torch.save(self.state_dict(), save_directory + "/pytorch_model.bin")
+        torch.save(self.state_dict(), save_directory + "/pytorch_model_2.bin")
     
 
 
@@ -442,6 +458,7 @@ class ErnieModel(ErniePreTrainedModel):
         token_type_ids: Optional[torch.Tensor] = None,
         task_type_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        last_all_embedding: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
@@ -543,9 +560,10 @@ class ErnieModel(ErniePreTrainedModel):
             inputs_embeds=inputs_embeds,
             past_key_values_length=past_key_values_length,
         )
-        encoder_outputs = self.encoder(
+        encoder_outputs, cur_all_embedding = self.encoder(
             embedding_output,
             attention_mask=extended_attention_mask,   # (bs, n, s, s)
+            last_all_embedding=last_all_embedding,   # n_layer list * tensor(bs, h)
             head_mask=head_mask,   # (n_layers, )
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_extended_attention_mask,
@@ -568,7 +586,7 @@ class ErnieModel(ErniePreTrainedModel):
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
             cross_attentions=encoder_outputs.cross_attentions,
-        )
+        ), cur_all_embedding
 
 
 class ErnieOutput(nn.Module):
@@ -591,6 +609,10 @@ class ErnieLayer(nn.Module):
         super().__init__()
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.seq_len_dim = 1
+        # last chunk's [CLS] hidden states merged with current [CLS] hidden states
+        self.update = nn.Linear(config.hidden_size, config.hidden_size)
+        self.input = nn.Linear(config.hidden_size, config.hidden_size)
+        
         self.attention = ErnieAttention(config)
         self.is_decoder = config.is_decoder
         self.add_cross_attention = config.add_cross_attention
@@ -603,14 +625,21 @@ class ErnieLayer(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor,   # (bs, s, h)
         attention_mask: Optional[torch.FloatTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
+        last_hidden_states: torch.Tensor = None,   # (bs, h)
         encoder_hidden_states: Optional[torch.FloatTensor] = None,
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
         past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         output_attentions: Optional[bool] = False,
     ) -> Tuple[torch.Tensor]:
+        # long distance dependency
+        if last_hidden_states is not None:
+            cur_embedding = self.input(hidden_states[:, 0, :])   # (bs, h)
+            last_embedding = self.update(last_hidden_states)   # (bs, h)
+            hidden_states[:, 0, :] = cur_embedding + last_embedding
+        
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
         self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
         self_attention_outputs = self.attention(
@@ -684,6 +713,7 @@ class ErnieEncoder(nn.Module):
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.FloatTensor] = None,
+        last_all_embedding: Optional[list[torch.FloatTensor]] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         encoder_hidden_states: Optional[torch.FloatTensor] = None,
         encoder_attention_mask: Optional[torch.FloatTensor] = None,
@@ -705,6 +735,7 @@ class ErnieEncoder(nn.Module):
                 use_cache = False
 
         next_decoder_cache = () if use_cache else None
+        cur_all_embedding = []
         for i, layer_module in enumerate(self.layer):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
@@ -725,6 +756,7 @@ class ErnieEncoder(nn.Module):
                     hidden_states,
                     attention_mask,
                     layer_head_mask,
+                    last_all_embedding[i] if len(last_all_embedding) > 0 else None,
                     encoder_hidden_states,
                     encoder_attention_mask,
                 )
@@ -733,6 +765,7 @@ class ErnieEncoder(nn.Module):
                     hidden_states,
                     attention_mask,
                     layer_head_mask,
+                    last_all_embedding[i] if len(last_all_embedding) > 0 else None,
                     encoder_hidden_states,
                     encoder_attention_mask,
                     past_key_value,
@@ -740,6 +773,7 @@ class ErnieEncoder(nn.Module):
                 )   # [(bs, s, h), ]
 
             hidden_states = layer_outputs[0]   # (bs, s, h)
+            cur_all_embedding.append(hidden_states[:, 0, :])   # (bs, h)
             if use_cache:
                 next_decoder_cache += (layer_outputs[-1],)
             if output_attentions:
@@ -768,7 +802,7 @@ class ErnieEncoder(nn.Module):
             hidden_states=all_hidden_states,
             attentions=all_self_attentions,
             cross_attentions=all_cross_attentions,
-        )
+        ), cur_all_embedding
 
 
 class ErnieEmbeddings(nn.Module):

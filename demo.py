@@ -14,4 +14,8 @@ from model.tie.modeling_tie import TIE, TIETokenizer
 # print(output.logits)   # (bs, s, vocab_size)
 
 model = TIE(encoder_config_path="model/tie")
-model.load_state_dict(torch.load("model/tie/pytorch_model.bin", map_location="cuda", weights_only=True))
+# model.load_state_dict(torch.load("model/tie/pytorch_model_1.bin"), strict=False)
+# model.save_pretrained("model/tie")
+model.load_state_dict(torch.load("model/tie/pytorch_model_2.bin", map_location="cuda", weights_only=True))
+for k, v in model.state_dict().items():
+    print(k, v.shape)
